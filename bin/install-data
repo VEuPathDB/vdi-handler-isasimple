@@ -41,9 +41,17 @@ for my $envVar (@envVars) { die "Missing env variable '$envVar'\n" unless $ENV{$
 
 my $dbh;
 unless ($DRYRUN) {
-  my $connectString = "dbi:$ENV{DB_PLATFORM}://$ENV{DB_HOST}:$ENV{DB_PORT}/$ENV{DB_NAME}";
-  $dbh = DBI->connect($connectString, $ENV{DB_USER}, $ENV{DB_PASS})
-    || die "Couldn't connect to database: " . DBI->errstr;
+  if ($ENV{DB_PLATFORM} eq "Oracle") {
+    my $connectString = "dbi:$ENV{DB_PLATFORM}://$ENV{DB_HOST}:$ENV{DB_PORT}/$ENV{DB_NAME}";
+    print STDERR "Connecting to $connectString\n";
+    $dbh = DBI->connect($connectString, $ENV{DB_USER}, $ENV{DB_PASS}) || die "Couldn't connect to database: " . DBI->errstr;
+  } elsif ($ENV{DB_PLATFORM} eq "Postgresql") {
+    my $connectString = "dbi:Pg:dbname=$ENV{DB_NAME};host=$ENV{DB_HOST};port=$ENV{DB_PORT}";
+    print STDERR "Connecting to $connectString\n";
+    $dbh = DBI->connect($connectString, $ENV{DB_USER}, $ENV{DB_PASS}) || die "Couldn't connect to database: " . DBI->errstr;
+  } else {
+    die "Unsupported DB_PLATFORM $ENV{DB_PLATFORM}";
+  }
 }
 $dbh->{RaiseError} = 1;
 $dbh->{AutoCommit} = 1;
@@ -84,7 +92,7 @@ foreach my $config (@$configsArray) {
 # loop through indexes
 foreach my $config (@$configsArray) {
   next unless $config->{type} eq 'index';
-  createIndex($dbh, $ENV{DB_SCHEMA}, $config, $indxTableSpace);
+  createIndex($dbh, $ENV{DB_PLATFORM}, $ENV{DB_SCHEMA}, $config, $indxTableSpace);
 }
 
 # loop through views
@@ -160,7 +168,7 @@ sub mapColValues {
 
   if ($valueFromFile eq '@USER_DATASET_ID@') { return "'$userDatasetId'"; }
   if ($valueFromFile eq '@STUDY_ID@') { return $platform eq 'Oracle'? "$schema.study_sq.nextval" : "nextval($schema.study_sq)"; }
-  if ($valueFromFile eq '@MODIFICATION_DATE@') { return "SYSDATE" ; }
+  if ($valueFromFile eq '@MODIFICATION_DATE@') { return $platform eq 'Oracle' ? "sysdate" : "current_timestamp::timestamp" ; }
   if ($valueFromFile eq '@ENTITY_TYPE_GRAPH_ID@') { return $platform eq 'Oracle'? "$schema.entitytypegraph_sq.nextval" : "nextval($schema.entitytypegraph_sq)"; }
   if (($colType eq 'SQL_NUMBER' or $colType eq 'SQL_DATE') and $valueFromFile eq "")  { return "NULL"; }
   if ($colType eq 'SQL_VARCHAR' or $colType eq 'SQL_DATE') { return "'$valueFromFile'"; }
@@ -201,7 +209,7 @@ sub createColumns {
     } elsif ($field->{type} eq 'SQL_DATE') {
       $colSpec .= " DATE";
     } elsif ($field->{type} eq 'SQL_NUMBER')  {
-      $colSpec .= " NUMBER" . ($field->{prec} eq 'NA'? "" : "($field->{prec})");
+      $colSpec .= ($field->{platform} eq 'Oracle' ? " NUMBER" : " NUMERIC") . ($field->{prec} eq 'NA'? "" : "($field->{prec})");
     } else { die "unrecognized SQL type: " + $field->{type}}
     $colSpec .= $field->{isNullable} eq 'YES'? "" : " NOT NULL";
     push(@colSpecs, $colSpec);
@@ -210,14 +218,14 @@ sub createColumns {
 }
 
 sub bulkLoadTable {
-  my ($inputDir, $platform, $dbUser, $dbPassword, $dbHost, $dbPort, $dbName, $schema, $tableConfig) = @_;
+  my ($inputDir, $platform, $dbUser, $dbPassword, $dbHost, $dbPort, $dbName, $schema, $tableConfig, $orderedFields) = @_;
 
   print STDERR "Bulk loading table $tableConfig->{name}\n";
   if ($platform eq 'Oracle') {
     my $controlFileName = $tableConfig->{name} . '.ctl';
     my $dataFileName = "$inputDir/" . $tableConfig->{name} . '.cache';
     my $logFileName = $tableConfig->{name} . '.log';
-    my $direct = $tableConfig->{is_preexisting_table}? 0 : 1;
+    my $direct = $tableConfig->{is_preexisting_table} ? 0 : 1;
     writeSqlloaderCtl($tableConfig->{fields}, $schema, $tableConfig->{name}, $controlFileName, $dataFileName, !$direct);
     my $cmdLine = getSqlLdrCmdLine($dbUser, $dbPassword, $dbHost, $dbPort, $dbName, $controlFileName, $logFileName, $direct);
 
@@ -251,7 +259,7 @@ sub bulkLoadTable {
         my $badFileName = $tableConfig->{name} . ".bad";
 
         if (-f $badFileName) {
-          print STDERR ">>> sqllder $badFileName file content\n\n";
+          print STDERR ">>> sqlldr $badFileName file content\n\n";
 
           open(LF, $badFileName);
           while (my $badLine = <LF>) {
@@ -263,13 +271,45 @@ sub bulkLoadTable {
         die;
       }
     }
+  } else {
+    my $dataFileName = "$inputDir/" . $tableConfig->{name} . '.cache';
+    my $tableName = $tableConfig->{name};
+    my $fields = $tableConfig->{fields};
+    my $colSpec = "(";
+    foreach my $field (@$fields) {
+      $colSpec .= $field->{name} . ",";
+    }
+    print STDERR "$colSpec\n";
+    $colSpec =~ s/,$//;  # Remove the trailing comma
+    $colSpec .= ")";
+
+    # Use backspace as the quote character to avoid stripping out quotes leaving invalid JSON for array columns.
+    my $copySql = "COPY $tableName $colSpec FROM STDIN WITH (FORMAT CSV, DELIMITER E'\t', HEADER false, QUOTE E'\b')";
+
+    open(my $fh, '<', $dataFileName) or die "Could not open file '$dataFileName' $!";
+
+    my $sth = $dbh->prepare($copySql);
+    $sth->execute();
+
+    while (my $line = <$fh>) {
+        $dbh->pg_putcopydata($line);
+    }
+
+    # Finish the COPY process
+    $dbh->pg_putcopyend();    
+    close($fh);
   }
 }
 
 sub createIndex {
-  my ($dbh, $schema, $indexConfig, $indxTableSpace) = @_;
+  my ($dbh, $platform, $schema, $indexConfig, $indxTableSpace) = @_;
 
-  my $indexName = "$schema.$indexConfig->{name}";
+  my $indexName;
+  if ($platform eq "Postgresql") {
+    $indexName = "$indexConfig->{name}";
+  } else {
+    $indexName = "$schema.$indexConfig->{name}";
+  }
   my $colArray = $indexConfig->{orderedColumns};
   my $cols = join(", ", @$colArray);
   my $createIndex = "CREATE INDEX $indexName on $schema.$indexConfig->{tableName} ($cols) $indxTableSpace";
